@@ -1,8 +1,3 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["requests", "python-dotenv", "pyarrow", "tqdm", "python-dateutil"]
-# ///
-
 """
 pull.py — extraction + cleaning pipeline (verbose logging build).
 
@@ -17,6 +12,7 @@ via checkpoint.json. Keep SOURCES + dates within your trial entitlement.
 from __future__ import annotations
 
 import json
+import gzip
 import time
 import pathlib
 from datetime import datetime, timezone, timedelta
@@ -30,8 +26,11 @@ from client import PanjivaClient
 import transform as T
 
 # --------------------------------------------------------------------------
+# Pull authorized US import/export. ~6 min per calendar-week (both sources),
+# so 12h ~= 2.3 years. Resumable: re-run to continue into the SAME folder.
+RUN_NAME = "us_2022_2024"          # output folder under <DATA_DIR>/raw/
 SOURCES = ["us-imports", "us-exports"]
-DATE_FROM = "2024-01-01"
+DATE_FROM = "2022-01-01"
 DATE_TO = "2024-03-31"
 CHUNK_DAYS = 7
 POLL_SECONDS = 30
@@ -113,6 +112,20 @@ def download_jsonl(c, url, dest):
     log(f"    downloaded {mb:,.1f} MB")
 
 
+def _open_text(path):
+    """Open as text whether the file is gzip-compressed or plain.
+
+    Panjiva serves the bulk download as gzipped JSONL, so we sniff the gzip
+    magic bytes (1f 8b) and decompress on the fly. errors='replace' keeps one
+    stray byte from killing an entire week's chunk during an unattended run.
+    """
+    with open(path, "rb") as fh:
+        magic = fh.read(2)
+    if magic == b"\x1f\x8b":
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return open(path, "r", encoding="utf-8", errors="replace")
+
+
 def jsonl_to_tables(src, source, ship_path, item_path, batch=50_000):
     ship_path.parent.mkdir(parents=True, exist_ok=True)
     item_path.parent.mkdir(parents=True, exist_ok=True)
@@ -130,7 +143,7 @@ def jsonl_to_tables(src, source, ship_path, item_path, batch=50_000):
             n_item += len(item_rows); item_rows = []
 
     try:
-        with open(src, "r", encoding="utf-8") as f:
+        with _open_text(src) as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -148,13 +161,13 @@ def jsonl_to_tables(src, source, ship_path, item_path, batch=50_000):
 
 def main():
     c = PanjivaClient()
-    run_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    root = pathlib.Path(c.s.data_dir) / "raw" / f"pull_{run_ts}"
+    root = pathlib.Path(c.s.data_dir) / "raw" / RUN_NAME
     tmp = root / "_jsonl"; tmp.mkdir(parents=True, exist_ok=True)
-    ckpt = Checkpoint(root.parent / "checkpoint.json")
+    ckpt = Checkpoint(root / "checkpoint.json")
 
     chunks = [(s, a, b) for s in SOURCES for (a, b) in day_chunks(DATE_FROM, DATE_TO, CHUNK_DAYS)]
-    log(f"Run {run_ts}: {len(chunks)} (source, {CHUNK_DAYS}d) chunks -> {root}")
+    log(f"Run '{RUN_NAME}': {len(chunks)} (source, {CHUNK_DAYS}d) chunks -> {root}")
+    log(f"  ({len(ckpt.done)} already done and will be skipped)")
 
     for i, (source, start, stop) in enumerate(chunks, 1):
         key = f"{source}:{start}"
